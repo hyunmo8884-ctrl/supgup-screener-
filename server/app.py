@@ -25,6 +25,23 @@ def date_param():
 def health():
     return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
 
+@app.route('/api/debug')
+def debug():
+    try:
+        date = date_param()
+        ohlcv = stock.get_market_ohlcv_by_ticker(date, market='KOSPI')
+        cap   = stock.get_market_cap_by_ticker(date, market='KOSPI')
+        net   = stock.get_market_net_purchases_of_equities_by_ticker(date, date, market='KOSPI')
+        return jsonify({
+            'date': date,
+            'ohlcv_columns': list(ohlcv.columns),
+            'cap_columns': list(cap.columns),
+            'net_columns': list(net.columns) if net is not None else [],
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/scan')
 def scan():
     try:
@@ -47,25 +64,36 @@ def scan():
 
         result = []
 
+        def get_col(df, *candidates):
+            for c in candidates:
+                if c in df.columns:
+                    return c
+            return None
+
         def build_rows(ohlcv, cap, net_df, names, market_name):
+            close_col  = get_col(ohlcv, '종가', 'Close', 'close')
+            change_col = get_col(ohlcv, '등락률', 'Change', 'change', 'Returns')
+            cap_col    = get_col(cap,   '시가총액', 'Mkt Cap', 'MarketCap')
+            shrs_col   = get_col(cap,   '상장주식수', 'Shares', 'shares')
+
             for ticker in ohlcv.index:
                 try:
-                    close = int(ohlcv.loc[ticker, '종가']) if '종가' in ohlcv.columns else 0
+                    close = int(ohlcv.loc[ticker, close_col]) if close_col else 0
                     if close <= 0:
                         continue
-                    change_rate = float(ohlcv.loc[ticker, '등락률']) if '등락률' in ohlcv.columns else 0.0
-                    mkt_cap   = int(cap.loc[ticker, '시가총액'])   if ticker in cap.index and '시가총액'   in cap.columns else 0
-                    list_shrs = int(cap.loc[ticker, '상장주식수']) if ticker in cap.index and '상장주식수' in cap.columns else 0
+                    change_rate = float(ohlcv.loc[ticker, change_col]) if change_col else 0.0
+                    mkt_cap   = int(cap.loc[ticker, cap_col])  if (ticker in cap.index and cap_col)  else 0
+                    list_shrs = int(cap.loc[ticker, shrs_col]) if (ticker in cap.index and shrs_col) else 0
 
                     frgn_net = 0
                     inst_net = 0
                     if net_df is not None and ticker in net_df.index:
                         row = net_df.loc[ticker]
-                        for col in ['외국인', '외국인합계', 'FOREIGNER']:
+                        for col in ['외국인', '외국인합계', 'Foreigner', 'Foreign']:
                             if col in net_df.columns:
                                 frgn_net = int(row[col])
                                 break
-                        for col in ['기관합계', '기관', 'INSTITUTION']:
+                        for col in ['기관합계', '기관', 'Institution', 'Institutional']:
                             if col in net_df.columns:
                                 inst_net = int(row[col])
                                 break
