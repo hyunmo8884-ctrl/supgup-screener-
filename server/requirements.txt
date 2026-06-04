@@ -1,4 +1,3 @@
 flask
 flask-cors
-pykrx==1.0.47
 gunicorn
