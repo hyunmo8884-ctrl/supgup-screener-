@@ -3,8 +3,6 @@ from flask_cors import CORS
 from datetime import datetime, timedelta
 import traceback
 import os
-import urllib.request
-import urllib.parse
 
 app = Flask(__name__)
 CORS(app)
@@ -26,60 +24,18 @@ def health():
 @app.route('/api/debug')
 def debug():
     try:
+        import FinanceDataReader as fdr
         date = get_date()
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'http://data.krx.co.kr/',
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
-        otp_payload = urllib.parse.urlencode({
-            'locale': 'ko_KR',
-            'mktId': 'STK',
-            'trdDd': date,
-            'money': '1',
-            'csvxls_isNo': 'false',
-            'name': 'fileDown',
-            'filetype': 'csv',
-            'url': 'dbms/MDC/STAT/standard/MDCSTAT02303',
-        }).encode()
-
-        otp_req = urllib.request.Request(
-            'http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd',
-            data=otp_payload, headers=headers
-        )
-        with urllib.request.urlopen(otp_req, timeout=15) as r:
-            otp = r.read().decode().strip()
-
-        down_payload = urllib.parse.urlencode({'code': otp}).encode()
-        down_req = urllib.request.Request(
-            'http://data.krx.co.kr/comm/fileDn/download_csv.cmd',
-            data=down_payload, headers=headers
-        )
-        with urllib.request.urlopen(down_req, timeout=15) as r:
-            raw_bytes = r.read()
-
-        for enc in ['utf-8-sig', 'euc-kr', 'cp949']:
-            try:
-                content = raw_bytes.decode(enc)
-                break
-            except Exception:
-                content = raw_bytes.decode('utf-8', errors='replace')
-
-        lines = content.strip().split('\n')
-
+        df = fdr.DataReader('005930', date, date)
         return jsonify({
             'date': date,
-            'otp': otp,
-            'total_lines': len(lines),
-            'header_line': lines[0] if lines else '',
-            'first_data_line': lines[1] if len(lines) > 1 else '',
-            'raw_first_500': content[:500],
+            'columns': list(df.columns),
+            'sample': df.to_dict(orient='records'),
+            'row_count': len(df),
         })
-
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
-
 
 @app.route('/api/scan')
 def scan():
@@ -109,6 +65,29 @@ def scan():
                     change_rate = float(row.get('ChagesRatio', 0) or 0)
                     mkt_cap     = int(float(row.get('Marcap', 0) or 0))
                     shares      = int(float(row.get('Stocks', 0) or 0))
+
+                    frgn_net = 0
+                    inst_net = 0
+                    try:
+                        stock_df = fdr.DataReader(ticker, date, date)
+                        if not stock_df.empty:
+                            cols = [c.lower() for c in stock_df.columns]
+                            for cname in ['foreignnetvolume', 'foreign_net', 'foreignnet']:
+                                matches = [i for i, c in enumerate(cols) if cname in c]
+                                if matches:
+                                    frgn_net = int(stock_df.iloc[-1, matches[0]])
+                                    break
+                            for cname in ['institutionnetvolume', 'institution_net', 'instnet']:
+                                matches = [i for i, c in enumerate(cols) if cname in c]
+                                if matches:
+                                    inst_net = int(stock_df.iloc[-1, matches[0]])
+                                    break
+                    except Exception:
+                        pass
+
+                    total_net = frgn_net + inst_net
+                    ratio     = (total_net / mkt_cap * 100) if mkt_cap > 0 else 0.0
+
                     result.append({
                         'isuCd':       ticker,
                         'isuNm':       name,
@@ -117,33 +96,33 @@ def scan():
                         'changeRate':  round(change_rate, 2),
                         'floatShares': shares,
                         'floatMktCap': mkt_cap,
-                        'foreignNet':  0,
-                        'instNet':     0,
-                        'totalNet':    0,
-                        'ratio':       0.0,
+                        'foreignNet':  frgn_net,
+                        'instNet':     inst_net,
+                        'totalNet':    total_net,
+                        'ratio':       round(ratio, 4),
                         'threshold':   round(mkt_cap * 0.003),
-                        'isHit':       False,
+                        'isHit':       ratio >= threshold,
                     })
                 except Exception:
                     pass
 
         build_rows(kospi_df,  'KOSPI')
         build_rows(kosdaq_df, 'KOSDAQ')
-        result.sort(key=lambda x: x['changeRate'], reverse=True)
+
+        result.sort(key=lambda x: x['ratio'], reverse=True)
+        hit_count = sum(1 for r in result if r['isHit'])
 
         return jsonify({
             'date':      date,
             'threshold': threshold,
             'total':     len(result),
-            'hitCount':  0,
+            'hitCount':  hit_count,
             'data':      result,
-            'notice':    '수급 데이터 연결 작업 중',
         })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
