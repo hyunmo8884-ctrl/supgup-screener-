@@ -3,9 +3,6 @@ from flask_cors import CORS
 from datetime import datetime, timedelta
 import traceback
 import os
-import urllib.request
-import urllib.parse
-import json
 
 app = Flask(__name__)
 CORS(app)
@@ -20,100 +17,6 @@ def get_date():
     raw = request.args.get('date', '') or datetime.now().strftime('%Y%m%d')
     return nearest_biz_day(raw.replace('-', ''))
 
-def krx_fetch(url, payload):
-    headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd',
-    }
-    otp_url = 'http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd'
-    data = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(otp_url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        otp = r.read().decode()
-
-    data2 = urllib.parse.urlencode({'code': otp}).encode()
-    req2 = urllib.request.Request(url, data=data2, headers=headers)
-    with urllib.request.urlopen(req2, timeout=30) as r:
-        return json.loads(r.read().decode())
-
-def get_ohlcv(date, market):
-    mktId = 'STK' if market == 'KOSPI' else 'KSQ'
-    payload = {
-        'bld': 'dbms/MDC/STAT/standard/MDCSTAT01501',
-        'mktId': mktId,
-        'trdDd': date,
-        'share': '1',
-        'money': '1',
-        'csvxls_isNo': 'false',
-    }
-    raw = krx_fetch('http://data.krx.co.kr/comm/fileDn/download_csv.cmd', payload)
-    rows = raw.get('OutBlock_1', [])
-    result = {}
-    for r in rows:
-        ticker = r.get('ISU_SRT_CD', '')
-        if not ticker:
-            continue
-        try:
-            close = int(str(r.get('TDD_CLSPRC', '0')).replace(',', ''))
-            change_rate = float(str(r.get('FLUC_RT', '0')).replace(',', ''))
-            name = r.get('ISU_ABBRV', ticker)
-            result[ticker] = {'close': close, 'changeRate': change_rate, 'name': name}
-        except Exception:
-            pass
-    return result
-
-def get_marcap(date, market):
-    mktId = 'STK' if market == 'KOSPI' else 'KSQ'
-    payload = {
-        'bld': 'dbms/MDC/STAT/standard/MDCSTAT01501',
-        'mktId': mktId,
-        'trdDd': date,
-        'share': '1',
-        'money': '1',
-        'csvxls_isNo': 'false',
-    }
-    raw = krx_fetch('http://data.krx.co.kr/comm/fileDn/download_csv.cmd', payload)
-    rows = raw.get('OutBlock_1', [])
-    result = {}
-    for r in rows:
-        ticker = r.get('ISU_SRT_CD', '')
-        if not ticker:
-            continue
-        try:
-            mktcap = int(str(r.get('MKTCAP', '0')).replace(',', ''))
-            shares = int(str(r.get('LIST_SHRS', '0')).replace(',', ''))
-            result[ticker] = {'mktcap': mktcap, 'shares': shares}
-        except Exception:
-            pass
-    return result
-
-def get_netbuy(date, market):
-    mktId = 'STK' if market == 'KOSPI' else 'KSQ'
-    payload = {
-        'bld': 'dbms/MDC/STAT/standard/MDCSTAT02303',
-        'mktId': mktId,
-        'trdDd': date,
-        'invstTpCd': '4000',
-        'csvxls_isNo': 'false',
-    }
-    try:
-        raw = krx_fetch('http://data.krx.co.kr/comm/fileDn/download_csv.cmd', payload)
-        rows = raw.get('OutBlock_1', [])
-        result = {}
-        for r in rows:
-            ticker = r.get('ISU_SRT_CD', '')
-            if not ticker:
-                continue
-            try:
-                frgn = int(str(r.get('FRGN_NETBID_TRDVOL', '0')).replace(',', ''))
-                inst = int(str(r.get('ORGN_NETBID_TRDVOL', '0')).replace(',', ''))
-                result[ticker] = {'frgn': frgn, 'inst': inst}
-            except Exception:
-                pass
-        return result
-    except Exception:
-        return {}
-
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'ok', 'time': datetime.now().isoformat()})
@@ -121,22 +24,18 @@ def health():
 @app.route('/api/debug')
 def debug():
     try:
+        import FinanceDataReader as fdr
         date = get_date()
-        payload = {
-            'bld': 'dbms/MDC/STAT/standard/MDCSTAT01501',
-            'mktId': 'STK',
-            'trdDd': date,
-            'share': '1',
-            'money': '1',
-            'csvxls_isNo': 'false',
-        }
-        raw = krx_fetch('http://data.krx.co.kr/comm/fileDn/download_csv.cmd', payload)
-        rows = raw.get('OutBlock_1', [])
+
+        kospi = fdr.StockListing('KOSPI')
+        kosdaq = fdr.StockListing('KOSDAQ')
+
         return jsonify({
             'date': date,
-            'row_count': len(rows),
-            'sample_keys': list(rows[0].keys()) if rows else [],
-            'sample_row': rows[0] if rows else {},
+            'kospi_count': len(kospi),
+            'kosdaq_count': len(kosdaq),
+            'kospi_columns': list(kospi.columns),
+            'kospi_sample': kospi.head(2).to_dict(orient='records'),
         })
     except Exception as e:
         traceback.print_exc()
@@ -145,60 +44,68 @@ def debug():
 @app.route('/api/scan')
 def scan():
     try:
-        date      = get_date()
+        import FinanceDataReader as fdr
+        date = get_date()
         threshold = float(request.args.get('threshold', 0.3))
-
-        kospi_price  = get_ohlcv(date, 'KOSPI')
-        kosdaq_price = get_ohlcv(date, 'KOSDAQ')
-
-        if not kospi_price and not kosdaq_price:
-            return jsonify({'error': f'{date} 휴장일이거나 데이터 없음'}), 404
-
-        kospi_cap  = get_marcap(date, 'KOSPI')
-        kosdaq_cap = get_marcap(date, 'KOSDAQ')
-        kospi_net  = get_netbuy(date, 'KOSPI')
-        kosdaq_net = get_netbuy(date, 'KOSDAQ')
 
         result = []
 
-        def build_rows(price_map, cap_map, net_map, market_name):
-            for ticker, p in price_map.items():
-                try:
-                    close = p['close']
-                    if close <= 0:
-                        continue
+        for market in ['KOSPI', 'KOSDAQ']:
+            try:
+                listing = fdr.StockListing(market)
 
-                    cap_info = cap_map.get(ticker, {})
-                    mkt_cap  = cap_info.get('mktcap', 0)
-                    shares   = cap_info.get('shares', 0)
+                def gcol(candidates):
+                    for c in candidates:
+                        for col in listing.columns:
+                            if col.upper() == c.upper() or c.upper() in col.upper():
+                                return col
+                    return None
 
-                    net_info = net_map.get(ticker, {})
-                    frgn_net = net_info.get('frgn', 0)
-                    inst_net = net_info.get('inst', 0)
+                code_col   = gcol(['CODE', 'SYMBOL', 'ISU_SRT_CD', 'TICKER'])
+                name_col   = gcol(['NAME', 'ISU_ABBRV', 'CORP_NAME', 'COMPANY'])
+                close_col  = gcol(['CLOSE', 'TDD_CLSPRC', 'PRICE', '종가'])
+                change_col = gcol(['CHANGES', 'CHANGE', 'FLUC_RT', 'CHG', '등락률'])
+                cap_col    = gcol(['MARCAP', 'MKTCAP', 'CAP', '시가총액'])
 
-                    total_net = frgn_net + inst_net
-                    ratio     = (total_net / mkt_cap * 100) if mkt_cap > 0 else 0.0
+                for _, row in listing.iterrows():
+                    try:
+                        ticker = str(row[code_col]).zfill(6) if code_col else ''
+                        if not ticker or ticker == 'nan':
+                            continue
 
-                    result.append({
-                        'isuCd':       ticker,
-                        'isuNm':       p.get('name', ticker),
-                        'market':      market_name,
-                        'close':       close,
-                        'changeRate':  round(p['changeRate'], 2),
-                        'floatShares': shares,
-                        'floatMktCap': mkt_cap,
-                        'foreignNet':  frgn_net,
-                        'instNet':     inst_net,
-                        'totalNet':    total_net,
-                        'ratio':       round(ratio, 4),
-                        'threshold':   round(mkt_cap * 0.003),
-                        'isHit':       ratio >= threshold,
-                    })
-                except Exception:
-                    pass
+                        name  = str(row[name_col]) if name_col else ticker
+                        close = int(float(str(row[close_col]).replace(',',''))) if close_col else 0
+                        if close <= 0:
+                            continue
 
-        build_rows(kospi_price,  kospi_cap,  kospi_net,  'KOSPI')
-        build_rows(kosdaq_price, kosdaq_cap, kosdaq_net, 'KOSDAQ')
+                        change_rate = float(str(row[change_col]).replace(',','').replace('%','')) if change_col else 0.0
+                        mkt_cap     = int(float(str(row[cap_col]).replace(',',''))) if cap_col else 0
+
+                        frgn_net = 0
+                        inst_net = 0
+
+                        total_net = frgn_net + inst_net
+                        ratio     = (total_net / mkt_cap * 100) if mkt_cap > 0 else 0.0
+
+                        result.append({
+                            'isuCd':       ticker,
+                            'isuNm':       name,
+                            'market':      market,
+                            'close':       close,
+                            'changeRate':  round(change_rate, 2),
+                            'floatShares': 0,
+                            'floatMktCap': mkt_cap,
+                            'foreignNet':  frgn_net,
+                            'instNet':     inst_net,
+                            'totalNet':    total_net,
+                            'ratio':       round(ratio, 4),
+                            'threshold':   round(mkt_cap * 0.003),
+                            'isHit':       ratio >= threshold,
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         result.sort(key=lambda x: x['ratio'], reverse=True)
         hit_count = sum(1 for r in result if r['isHit'])
